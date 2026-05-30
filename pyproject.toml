@@ -36,9 +36,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/YOUR_USERNAME/graph-context"
-Repository = "https://github.com/YOUR_USERNAME/graph-context"
-Issues = "https://github.com/YOUR_USERNAME/graph-context/issues"
+Homepage = "https://github.com/yuqiaohan95/graph-context"
+Repository = "https://github.com/yuqiaohan95/graph-context"
+Issues = "https://github.com/yuqiaohan95/graph-context/issues"
 
 [project.scripts]
 graph-context = "graph_context:main"

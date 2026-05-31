@@ -1,5 +1,5 @@
 """
-MCP Server — v6 优化版
+MCP Server -- v6 优化版
   - 新增 MVCC 快照工具
   - 新增规则管理工具 (add_rule, list_rules, evaluate_rules, apply_rule, prune_rules)
   - 新增项目作用域工具 (create_scope, link_projects, search_across_projects)
@@ -36,7 +36,6 @@ mcp = FastMCP("mcporter")
 
 
 def _get_engine() -> VibeCodingEngine:
-    """懒初始化引擎：首次调用时从环境变量读取配置"""
     global _engine, _initialized
     if _engine is not None:
         return _engine
@@ -46,7 +45,6 @@ def _get_engine() -> VibeCodingEngine:
 
         root = os.environ.get("PROJECT_ROOT", os.getcwd())
         config = dict(DEFAULT_CONFIG)
-
         if os.environ.get("MCP_MAX_TOKENS"):
             config["max_context_tokens"] = int(os.environ["MCP_MAX_TOKENS"])
         if os.environ.get("MCP_TOP_K"):
@@ -67,7 +65,6 @@ def _get_engine() -> VibeCodingEngine:
 
 
 def _get_rules_store() -> RulesStore:
-    """获取规则存储实例"""
     global _rules_store
     if _rules_store is None:
         persist = os.environ.get("MCP_RULES_PATH", "rules/rules.json")
@@ -76,12 +73,59 @@ def _get_rules_store() -> RulesStore:
 
 
 def _get_scope_manager() -> ScopeManager:
-    """获取作用域管理器实例"""
     global _scope_manager
     if _scope_manager is None:
         persist = os.environ.get("MCP_SCOPES_PATH", "scopes/scopes.json")
         _scope_manager = ScopeManager(persist_path=persist)
+        _ensure_all_scopes_have_engines(_scope_manager)
     return _scope_manager
+
+
+def _ensure_all_scopes_have_engines(manager: ScopeManager):
+    """Ensure all scopes have engines bound. Creates default scope if none exist."""
+    main_engine = _get_engine()
+    main_root = str(main_engine.project_root)
+    default_id = Path(main_root).name
+
+    # 1. Auto-create default scope for the main project
+    if manager.get_scope(default_id) is None:
+        manager.create_scope(
+            project_id=default_id,
+            root=main_root,
+            isolation="shared",
+            description="Default project (auto-registered)",
+        )
+
+    # 2. Share main engine with any scope that shares the same root (avoid re-index)
+    for scope in manager.list_scopes():
+        if manager.get_engine(scope.project_id) is not None:
+            continue
+        if os.path.abspath(scope.root) == os.path.abspath(main_root):
+            manager.bind_engine(scope.project_id, main_engine)
+
+    # 3. Create independent engines for scopes with different roots (persisted scopes)
+    config = dict(DEFAULT_CONFIG)
+    if os.environ.get("MCP_MAX_TOKENS"):
+        config["max_context_tokens"] = int(os.environ["MCP_MAX_TOKENS"])
+    if os.environ.get("MCP_TOP_K"):
+        config["memory_top_k"] = int(os.environ["MCP_TOP_K"])
+    if os.environ.get("MCP_MAX_HOPS"):
+        config["max_hops"] = int(os.environ["MCP_MAX_HOPS"])
+    if os.environ.get("MCP_CACHE_SIZE"):
+        config["cache_max_size"] = int(os.environ["MCP_CACHE_SIZE"])
+
+    for scope in manager.list_scopes():
+        if manager.get_engine(scope.project_id) is not None:
+            continue
+        if not os.path.isdir(scope.root):
+            continue
+        try:
+            eng = VibeCodingEngine(scope.root, config)
+            eng.index_project()
+            eng.start_watching()
+            manager.bind_engine(scope.project_id, eng)
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════
@@ -254,7 +298,7 @@ def update_config(key: str, value: str) -> str:
 
 
 # ══════════════════════════════════════════════════
-#  V6 工具 — MVCC 快照
+#  V6 工具 -- MVCC 快照
 # ══════════════════════════════════════════════════
 
 @mcp.tool()
@@ -318,7 +362,7 @@ def get_mvcc_status() -> str:
 
 
 # ══════════════════════════════════════════════════
-#  V6 工具 — 规则管理
+#  V6 工具 -- 规则管理
 # ══════════════════════════════════════════════════
 
 @mcp.tool()
@@ -352,7 +396,6 @@ def add_rule(
     """
     store = _get_rules_store()
 
-    # 冲突检测
     rule = Rule(
         rule_id="",
         rule_type=rule_type,
@@ -481,13 +524,9 @@ def prune_rules(min_hit_rate: float = 0.1, min_uses: int = 5) -> str:
         min_uses: Minimum number of uses before pruning (default 5)
     """
     store = _get_rules_store()
-    # 基于准确率的衰减
     decay_disabled = store.apply_decay()
-    # 清理低效规则
     pruned = store.prune_rules(min_hit_rate=min_hit_rate, min_uses=min_uses)
-    # 提升观察期规则
     promoted = store.promote_observing_rules()
-    # 禁用观察期中表现极差的规则
     demoted = store.demote_failing_rules()
     return json.dumps({
         "decay_disabled": decay_disabled,
@@ -520,7 +559,7 @@ def verify_rule(rule_id: str, correct: bool = True) -> str:
     else:
         store.record_rejected(rule_id)
 
-    rule = store.get_rule(rule_id)  # re-fetch
+    rule = store.get_rule(rule_id)
     return json.dumps({
         "rule_id": rule_id,
         "verified_count": rule.verified_count,
@@ -599,7 +638,7 @@ def check_code_freshness() -> str:
 
 
 # ══════════════════════════════════════════════════
-#  V6 工具 — 项目作用域
+#  V6 工具 -- 项目作用域
 # ══════════════════════════════════════════════════
 
 @mcp.tool()
@@ -622,22 +661,43 @@ def create_scope(
         tags: Optional tags
     """
     manager = _get_scope_manager()
-    try:
-        scope = manager.create_scope(
-            project_id=project_id,
-            root=root,
-            isolation=isolation,
-            description=description,
-            tags=tags or [],
-        )
-        return json.dumps({
-            "project_id": scope.project_id,
-            "root": scope.root,
-            "isolation": scope.isolation,
-            "message": f"Scope '{project_id}' created",
-        }, indent=2)
-    except ValueError as e:
-        return json.dumps({"error": str(e)})
+    if manager.get_scope(project_id):
+        return json.dumps({"error": f"Scope '{project_id}' already exists"})
+
+    root_resolved = str(Path(root).resolve())
+    tags_list = tags or []
+
+    # 1. Create engine first (may fail -- scope won't be persisted as zombie)
+    config = dict(DEFAULT_CONFIG)
+    if os.environ.get("MCP_MAX_TOKENS"):
+        config["max_context_tokens"] = int(os.environ["MCP_MAX_TOKENS"])
+    if os.environ.get("MCP_TOP_K"):
+        config["memory_top_k"] = int(os.environ["MCP_TOP_K"])
+    if os.environ.get("MCP_MAX_HOPS"):
+        config["max_hops"] = int(os.environ["MCP_MAX_HOPS"])
+    if os.environ.get("MCP_CACHE_SIZE"):
+        config["cache_max_size"] = int(os.environ["MCP_CACHE_SIZE"])
+
+    engine = VibeCodingEngine(root_resolved, config)
+    engine.index_project()
+    engine.start_watching()
+
+    # 2. Engine ready -- persist scope data and bind
+    scope = manager.create_scope(
+        project_id=project_id,
+        root=root_resolved,
+        isolation=isolation,
+        description=description,
+        tags=tags_list,
+    )
+    manager.bind_engine(project_id, engine)
+
+    return json.dumps({
+        "project_id": scope.project_id,
+        "root": scope.root,
+        "isolation": scope.isolation,
+        "message": f"Scope '{project_id}' created and engine bound",
+    }, indent=2)
 
 
 @mcp.tool()
@@ -731,7 +791,13 @@ def list_scopes() -> str:
             "cross_references": list(s.cross_references.keys()),
             "tags": s.tags,
         })
-    stats = manager.stats()
+    stats = {
+        "total_projects": len(scopes),
+        "strict_projects": sum(1 for s in scopes if s.isolation == "strict"),
+        "shared_projects": sum(1 for s in scopes if s.isolation == "shared"),
+        "total_links": sum(len(s.cross_references) for s in scopes) // 2,
+        "engines_bound": len(manager._engines) if hasattr(manager, "_engines") else 0,
+    }
     return json.dumps({
         "stats": stats,
         "scopes": result,

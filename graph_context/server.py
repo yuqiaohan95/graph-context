@@ -20,6 +20,7 @@ except ImportError:
 from .engine import VibeCodingEngine, DEFAULT_CONFIG
 from .rules import Rule, RulesStore
 from .project_scope import ScopeManager
+from . import synonyms as _synonyms_mod
 
 # ══════════════════════════════════════════════════
 #  全局状态
@@ -31,6 +32,17 @@ _initialized = False
 
 _rules_store: RulesStore | None = None
 _scope_manager: ScopeManager | None = None
+
+# 自动进化
+_retrieval_counter = 0
+_gt_log_path: str | None = None
+_gt_log_lock = threading.Lock()
+
+# 同义词管理
+_custom_synonyms_path: str | None = None
+_custom_synonyms: dict[str, list[str]] = {}
+_unmatched_tokens_log: list[dict] = []
+_synonyms_lock = threading.Lock()
 
 mcp = FastMCP("mcporter")
 
@@ -59,6 +71,7 @@ def _get_engine() -> VibeCodingEngine:
         engine = VibeCodingEngine(root, config)
         engine.index_project()
         engine.start_watching()
+        _ensure_custom_synonyms()
         _engine = engine
         _initialized = True
         return engine
@@ -128,6 +141,120 @@ def _ensure_all_scopes_have_engines(manager: ScopeManager):
             pass
 
 
+_IMPLICIT_GT_MAX = 1000  # 最多保留 1000 条隐式 GT 记录
+
+
+def _ensure_custom_synonyms():
+    """加载自定义同义词并注入到 synonyms 模块。"""
+    global _custom_synonyms_path, _custom_synonyms
+    if _custom_synonyms_path is not None:
+        return
+    root = os.environ.get("PROJECT_ROOT", os.getcwd())
+    _custom_synonyms_path = os.environ.get(
+        "MCP_CUSTOM_SYNONYMS_PATH",
+        os.path.join(root, "ground_truth", "custom_synonyms.json"),
+    )
+    if os.path.exists(_custom_synonyms_path):
+        try:
+            with open(_custom_synonyms_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _custom_synonyms = data
+                for cn, ens in data.items():
+                    if cn not in _synonyms_mod.SYNONYM_MAP:
+                        _synonyms_mod.SYNONYM_MAP[cn] = []
+                    for en in ens:
+                        if en not in _synonyms_mod.SYNONYM_MAP[cn]:
+                            _synonyms_mod.SYNONYM_MAP[cn].append(en)
+                            _synonyms_mod._REVERSE_MAP.setdefault(en, []).append(cn)
+        except Exception:
+            pass
+
+
+def _save_custom_synonyms():
+    """持久化自定义同义词。"""
+    path = _custom_synonyms_path
+    if path is None:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(_custom_synonyms, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _track_unmatched_tokens(query: str):
+    """从查询中提取不在同义词表中的中文 token，用于发现候选同义词。"""
+    import re
+    for cn_block in re.findall(r"[\u4e00-\u9fff]+", query):
+        # 移除已匹配的子串（按长度降序，避免短串误删）
+        remaining = cn_block
+        for key in sorted(_synonyms_mod.SYNONYM_MAP.keys(), key=len, reverse=True):
+            remaining = remaining.replace(key, "")
+        remaining = remaining.strip()
+        if remaining:
+            with _synonyms_lock:
+                _unmatched_tokens_log.append({
+                    "token": remaining,
+                    "query": query,
+                    "timestamp": time.time(),
+                })
+                if len(_unmatched_tokens_log) > 200:
+                    _unmatched_tokens_log.pop(0)
+
+
+def _log_implicit_gt(query: str, results: list):
+    """隐式收集每次检索的 query + top-k 结果作为 Ground Truth 候选。"""
+    global _gt_log_path
+    if _gt_log_path is None:
+        root = os.environ.get("PROJECT_ROOT", os.getcwd())
+        gt_dir = os.environ.get("MCP_GT_DIR", os.path.join(root, "ground_truth"))
+        os.makedirs(gt_dir, exist_ok=True)
+        _gt_log_path = os.path.join(gt_dir, "implicit_gt.jsonl")
+    try:
+        entry = {
+            "query": query,
+            "results": [
+                {
+                    "score": round(float(s), 4),
+                    "file_path": getattr(c, "file_path", ""),
+                    "name": getattr(c, "name", ""),
+                    "chunk_type": getattr(c, "chunk_type", ""),
+                }
+                for s, c in results[:5]
+            ],
+            "timestamp": time.time(),
+        }
+        with _gt_log_lock:
+            path = _gt_log_path
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # 简单轮转：超过阈值时清空
+            if os.path.getsize(path) > _IMPLICIT_GT_MAX * 500:
+                os.rename(path, path + ".old")
+    except Exception:
+        pass
+
+
+def _auto_evolve():
+    """每 N 次检索后触发一次规则维护。"""
+    global _retrieval_counter
+    _retrieval_counter += 1
+    if _retrieval_counter % 50 != 0:
+        return
+    try:
+        store = _get_rules_store()
+        engine = _get_engine()
+        store.promote_observing_rules()
+        store.demote_failing_rules()
+        store.apply_decay()
+        store.prune_rules()
+        store.check_code_freshness(engine)
+    except Exception:
+        pass
+
+
 # ══════════════════════════════════════════════════
 #  V5 工具（完全兼容）
 # ══════════════════════════════════════════════════
@@ -144,6 +271,14 @@ def retrieve_context(query: str, top_k: int = 5) -> str:
     """
     engine = _get_engine()
     results = engine.retrieve(query, top_k=top_k)
+    # 钩子1: 规则影响排序
+    results = _get_rules_store().apply_rules_to_query(query, results)
+    # 钩子2: 同义词未匹配跟踪
+    _track_unmatched_tokens(query)
+    # 钩子3: 隐式 GT 收集
+    _log_implicit_gt(query, results)
+    # 钩子4: 定期维护
+    _auto_evolve()
     return engine.format_results(results)
 
 
@@ -160,6 +295,10 @@ def retrieve_context_adaptive(query: str, top_k: int = 5) -> str:
     """
     engine = _get_engine()
     results = engine.retrieve_adaptive(query, top_k=top_k)
+    results = _get_rules_store().apply_rules_to_query(query, results)
+    _track_unmatched_tokens(query)
+    _log_implicit_gt(query, results)
+    _auto_evolve()
     return engine.format_results(results)
 
 
@@ -175,6 +314,10 @@ def retrieve_with_dependencies(query: str, top_k: int = 5) -> str:
     """
     engine = _get_engine()
     results = engine.retrieve_with_deps(query, top_k=top_k)
+    results = _get_rules_store().apply_rules_to_query(query, results)
+    _track_unmatched_tokens(query)
+    _log_implicit_gt(query, results)
+    _auto_evolve()
     return engine.format_results(results)
 
 
@@ -801,6 +944,92 @@ def list_scopes() -> str:
     return json.dumps({
         "stats": stats,
         "scopes": result,
+    }, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def add_synonym(cn_term: str, en_terms: list[str]) -> str:
+    """
+    Add a Chinese-English synonym mapping.
+    New terms are immediately available for query expansion and persisted
+    across restarts.
+
+    Args:
+        cn_term: Chinese term (e.g. "样品")
+        en_terms: English code identifiers (e.g. ["sample", "specimen", "aliquot"])
+    """
+    _ensure_custom_synonyms()
+    if not cn_term or not en_terms:
+        return json.dumps({"error": "cn_term and en_terms required"}, indent=2)
+
+    with _synonyms_lock:
+        # 更新自定义同义词持久化
+        if cn_term not in _custom_synonyms:
+            _custom_synonyms[cn_term] = []
+        added = []
+        for en in en_terms:
+            if en not in _custom_synonyms[cn_term]:
+                _custom_synonyms[cn_term].append(en)
+                added.append(en)
+        _save_custom_synonyms()
+
+        # 注入到运行时模块
+        if cn_term not in _synonyms_mod.SYNONYM_MAP:
+            _synonyms_mod.SYNONYM_MAP[cn_term] = []
+        for en in added:
+            if en not in _synonyms_mod.SYNONYM_MAP[cn_term]:
+                _synonyms_mod.SYNONYM_MAP[cn_term].append(en)
+                _synonyms_mod._REVERSE_MAP.setdefault(en, []).append(cn_term)
+
+    return json.dumps({
+        "cn_term": cn_term,
+        "added": added,
+        "total_mappings": len(_custom_synonyms),
+        "message": f"Synonym '{cn_term}' -> {added} added",
+    }, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def discover_synonyms() -> str:
+    """
+    Discover candidate Chinese-English synonym mappings from recent queries.
+    Analyzes unmatched Chinese tokens and co-occurring English identifiers
+    in retrieval results. Returns candidate suggestions.
+
+    The LLM can review these candidates and add them with add_synonym().
+    """
+    _ensure_custom_synonyms()
+    with _synonyms_lock:
+        if not _unmatched_tokens_log:
+            return json.dumps({
+                "count": 0,
+                "candidates": [],
+                "message": "No unmatched Chinese tokens found. Make some queries with Chinese terms first.",
+            }, indent=2, ensure_ascii=False)
+
+        # 统计未匹配 token 频率
+        from collections import Counter
+        token_counts = Counter(item["token"] for item in _unmatched_tokens_log)
+
+        # 过滤已在同义词表中的
+        candidates = []
+        for token, count in token_counts.most_common(20):
+            if token in _synonyms_mod.SYNONYM_MAP:
+                continue
+            exists = any(key in token for key in _synonyms_mod.SYNONYM_MAP)
+            if exists:
+                continue
+            candidates.append({
+                "cn_term": token,
+                "frequency": count,
+                "suggestion": f"Consider mapping '{token}' to its English counterpart",
+            })
+
+    return json.dumps({
+        "count": len(candidates),
+        "candidates": candidates,
+        "total_unmatched_logged": len(_unmatched_tokens_log),
+        "message": "Use add_synonym() to add a mapping for any candidate above",
     }, indent=2, ensure_ascii=False)
 
 

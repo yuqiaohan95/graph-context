@@ -1,9 +1,14 @@
 """
-MCP Server -- v6 优化版
-  - 新增 MVCC 快照工具
-  - 新增规则管理工具 (add_rule, list_rules, evaluate_rules, apply_rule, prune_rules)
-  - 新增项目作用域工具 (create_scope, link_projects, search_across_projects)
-  - 保持 V5 所有工具兼容
+MCP Server -- v6 动态加载版 (优化后)
+  - 启动时只注入 2 个工具: search + tools (~600 tokens)
+  - 其他工具按需加载: tools(action="load", module="rules")
+  - 加载后客户端收到 tools/list_changed 通知
+  - 支持 unload 卸载不需要的工具
+
+优化:
+  - MODULE_REGISTRY 只构建一次
+  - _loaded_modules 改为 per-session 隔离 (通过 _session_loaded 映射)
+  - load/unload 返回 fallback 提示, 兼容不支持 list_changed 的客户端
 """
 
 import os
@@ -11,11 +16,12 @@ import json
 import time
 import threading
 from pathlib import Path
+from typing import Any
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP, Context
 except ImportError:
-    from mcp.server.fast_server import FastMCP
+    from mcp.server.fast_server import FastMCP, Context
 
 from .engine import VibeCodingEngine, DEFAULT_CONFIG
 from .rules import Rule, RulesStore
@@ -29,23 +35,43 @@ from . import synonyms as _synonyms_mod
 _engine: VibeCodingEngine | None = None
 _engine_lock = threading.Lock()
 _initialized = False
-
 _rules_store: RulesStore | None = None
 _scope_manager: ScopeManager | None = None
-
-# 自动进化
 _retrieval_counter = 0
 _gt_log_path: str | None = None
 _gt_log_lock = threading.Lock()
-
-# 同义词管理
 _custom_synonyms_path: str | None = None
 _custom_synonyms: dict[str, list[str]] = {}
 _unmatched_tokens_log: list[dict] = []
 _synonyms_lock = threading.Lock()
 
+# 动态加载状态 — per-session 隔离
+# key: session_id (str), value: set of loaded module names
+_session_loaded: dict[str, set[str]] = {}
+_session_loaded_lock = threading.Lock()
+
 mcp = FastMCP("mcporter")
 
+
+def _get_session_id(ctx: Context | None) -> str:
+    """从 Context 提取 session id, 无 context 时 fallback 到 'default'"""
+    if ctx and hasattr(ctx, "session") and ctx.session:
+        return str(id(ctx.session))
+    return "default"
+
+
+def _get_loaded_modules(ctx: Context | None) -> set[str]:
+    """获取当前 session 的已加载模块集合"""
+    sid = _get_session_id(ctx)
+    with _session_loaded_lock:
+        if sid not in _session_loaded:
+            _session_loaded[sid] = set()
+        return _session_loaded[sid]
+
+
+# ══════════════════════════════════════════════════
+#  辅助函数
+# ══════════════════════════════════════════════════
 
 def _get_engine() -> VibeCodingEngine:
     global _engine, _initialized
@@ -54,20 +80,18 @@ def _get_engine() -> VibeCodingEngine:
     with _engine_lock:
         if _engine is not None:
             return _engine
-
         root = os.environ.get("PROJECT_ROOT", os.getcwd())
         config = dict(DEFAULT_CONFIG)
-        if os.environ.get("MCP_MAX_TOKENS"):
-            config["max_context_tokens"] = int(os.environ["MCP_MAX_TOKENS"])
-        if os.environ.get("MCP_TOP_K"):
-            config["memory_top_k"] = int(os.environ["MCP_TOP_K"])
-        if os.environ.get("MCP_MAX_HOPS"):
-            config["max_hops"] = int(os.environ["MCP_MAX_HOPS"])
+        for env_key, cfg_key, typ in [
+            ("MCP_MAX_TOKENS", "max_context_tokens", int),
+            ("MCP_TOP_K", "memory_top_k", int),
+            ("MCP_MAX_HOPS", "max_hops", int),
+            ("MCP_CACHE_SIZE", "cache_max_size", int),
+        ]:
+            if os.environ.get(env_key):
+                config[cfg_key] = typ(os.environ[env_key])
         if os.environ.get("MCP_PERSIST_PATH"):
             config["persist_path"] = os.environ["MCP_PERSIST_PATH"]
-        if os.environ.get("MCP_CACHE_SIZE"):
-            config["cache_max_size"] = int(os.environ["MCP_CACHE_SIZE"])
-
         engine = VibeCodingEngine(root, config)
         engine.index_project()
         engine.start_watching()
@@ -95,38 +119,19 @@ def _get_scope_manager() -> ScopeManager:
 
 
 def _ensure_all_scopes_have_engines(manager: ScopeManager):
-    """Ensure all scopes have engines bound. Creates default scope if none exist."""
     main_engine = _get_engine()
     main_root = str(main_engine.project_root)
     default_id = Path(main_root).name
-
-    # 1. Auto-create default scope for the main project
     if manager.get_scope(default_id) is None:
-        manager.create_scope(
-            project_id=default_id,
-            root=main_root,
-            isolation="shared",
-            description="Default project (auto-registered)",
-        )
-
-    # 2. Share main engine with any scope that shares the same root (avoid re-index)
+        manager.create_scope(project_id=default_id, root=main_root, isolation="shared", description="Default")
     for scope in manager.list_scopes():
         if manager.get_engine(scope.project_id) is not None:
             continue
         if os.path.abspath(scope.root) == os.path.abspath(main_root):
             manager.bind_engine(scope.project_id, main_engine)
-
-    # 3. Create independent engines for scopes with different roots (persisted scopes)
     config = dict(DEFAULT_CONFIG)
-    if os.environ.get("MCP_MAX_TOKENS"):
-        config["max_context_tokens"] = int(os.environ["MCP_MAX_TOKENS"])
-    if os.environ.get("MCP_TOP_K"):
-        config["memory_top_k"] = int(os.environ["MCP_TOP_K"])
-    if os.environ.get("MCP_MAX_HOPS"):
-        config["max_hops"] = int(os.environ["MCP_MAX_HOPS"])
-    if os.environ.get("MCP_CACHE_SIZE"):
-        config["cache_max_size"] = int(os.environ["MCP_CACHE_SIZE"])
-
+    for ek, ck, t in [("MCP_MAX_TOKENS","max_context_tokens",int),("MCP_TOP_K","memory_top_k",int),("MCP_MAX_HOPS","max_hops",int),("MCP_CACHE_SIZE","cache_max_size",int)]:
+        if os.environ.get(ek): config[ck] = t(os.environ[ek])
     for scope in manager.list_scopes():
         if manager.get_engine(scope.project_id) is not None:
             continue
@@ -141,11 +146,10 @@ def _ensure_all_scopes_have_engines(manager: ScopeManager):
             pass
 
 
-_IMPLICIT_GT_MAX = 1000  # 最多保留 1000 条隐式 GT 记录
+_IMPLICIT_GT_MAX = 1000
 
 
 def _ensure_custom_synonyms():
-    """加载自定义同义词并注入到 synonyms 模块。"""
     global _custom_synonyms_path, _custom_synonyms
     if _custom_synonyms_path is not None:
         return
@@ -172,7 +176,6 @@ def _ensure_custom_synonyms():
 
 
 def _save_custom_synonyms():
-    """持久化自定义同义词。"""
     path = _custom_synonyms_path
     if path is None:
         return
@@ -185,27 +188,20 @@ def _save_custom_synonyms():
 
 
 def _track_unmatched_tokens(query: str):
-    """从查询中提取不在同义词表中的中文 token，用于发现候选同义词。"""
     import re
     for cn_block in re.findall(r"[\u4e00-\u9fff]+", query):
-        # 移除已匹配的子串（按长度降序，避免短串误删）
         remaining = cn_block
         for key in sorted(_synonyms_mod.SYNONYM_MAP.keys(), key=len, reverse=True):
             remaining = remaining.replace(key, "")
         remaining = remaining.strip()
         if remaining:
             with _synonyms_lock:
-                _unmatched_tokens_log.append({
-                    "token": remaining,
-                    "query": query,
-                    "timestamp": time.time(),
-                })
+                _unmatched_tokens_log.append({"token": remaining, "query": query, "timestamp": time.time()})
                 if len(_unmatched_tokens_log) > 200:
                     _unmatched_tokens_log.pop(0)
 
 
 def _log_implicit_gt(query: str, results: list):
-    """隐式收集每次检索的 query + top-k 结果作为 Ground Truth 候选。"""
     global _gt_log_path
     if _gt_log_path is None:
         root = os.environ.get("PROJECT_ROOT", os.getcwd())
@@ -216,29 +212,21 @@ def _log_implicit_gt(query: str, results: list):
         entry = {
             "query": query,
             "results": [
-                {
-                    "score": round(float(s), 4),
-                    "file_path": getattr(c, "file_path", ""),
-                    "name": getattr(c, "name", ""),
-                    "chunk_type": getattr(c, "chunk_type", ""),
-                }
+                {"score": round(float(s), 4), "file_path": getattr(c, "file_path", ""), "name": getattr(c, "name", ""), "chunk_type": getattr(c, "chunk_type", "")}
                 for s, c in results[:5]
             ],
             "timestamp": time.time(),
         }
         with _gt_log_lock:
-            path = _gt_log_path
-            with open(path, "a", encoding="utf-8") as f:
+            with open(_gt_log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            # 简单轮转：超过阈值时清空
-            if os.path.getsize(path) > _IMPLICIT_GT_MAX * 500:
-                os.rename(path, path + ".old")
+            if os.path.getsize(_gt_log_path) > _IMPLICIT_GT_MAX * 500:
+                os.rename(_gt_log_path, _gt_log_path + ".old")
     except Exception:
         pass
 
 
 def _auto_evolve():
-    """每 N 次检索后触发一次规则维护。"""
     global _retrieval_counter
     _retrieval_counter += 1
     if _retrieval_counter % 50 != 0:
@@ -255,794 +243,374 @@ def _auto_evolve():
         pass
 
 
+def _post_retrieve(query: str, results: list) -> list:
+    results = _get_rules_store().apply_rules_to_query(query, results)
+    _track_unmatched_tokens(query)
+    _log_implicit_gt(query, results)
+    _auto_evolve()
+    return results
+
+
 # ══════════════════════════════════════════════════
-#  V5 工具（完全兼容）
+#  动态工具模块定义 (只构建一次)
 # ══════════════════════════════════════════════════
 
-@mcp.tool()
-def retrieve_context(query: str, top_k: int = 5) -> str:
-    """
-    Retrieve the most relevant code chunks for a given query.
-    Uses graph diffusion to find related code based on token co-occurrence.
-
-    Args:
-        query: The query to search for
-        top_k: The number of results to return
-    """
-    engine = _get_engine()
-    results = engine.retrieve(query, top_k=top_k)
-    # 钩子1: 规则影响排序
-    results = _get_rules_store().apply_rules_to_query(query, results)
-    # 钩子2: 同义词未匹配跟踪
-    _track_unmatched_tokens(query)
-    # 钩子3: 隐式 GT 收集
-    _log_implicit_gt(query, results)
-    # 钩子4: 定期维护
-    _auto_evolve()
-    return engine.format_results(results)
+MODULE_REGISTRY: dict[str, dict[str, Any]] = {}
+_registry_built = False
+_registry_lock = threading.Lock()
 
 
-@mcp.tool()
-def retrieve_context_adaptive(query: str, top_k: int = 5) -> str:
-    """
-    Retrieve context with adaptive strategy.
-    Automatically switches between full-context scoring (small projects)
-    and graph diffusion (large projects) based on project size.
-
-    Args:
-        query: The query to search for
-        top_k: The number of results to return
-    """
-    engine = _get_engine()
-    results = engine.retrieve_adaptive(query, top_k=top_k)
-    results = _get_rules_store().apply_rules_to_query(query, results)
-    _track_unmatched_tokens(query)
-    _log_implicit_gt(query, results)
-    _auto_evolve()
-    return engine.format_results(results)
+def _ensure_registry():
+    """确保 MODULE_REGISTRY 只构建一次"""
+    global _registry_built
+    if _registry_built:
+        return
+    with _registry_lock:
+        if _registry_built:
+            return
+        _build_module_registry()
+        _registry_built = True
 
 
-@mcp.tool()
-def retrieve_with_dependencies(query: str, top_k: int = 5) -> str:
-    """
-    Retrieve relevant code chunks AND their cross-file dependencies.
-    Returns relevant code plus related functions/classes from other files.
+def _build_module_registry():
+    """构建可按需加载的工具模块注册表"""
 
-    Args:
-        query: The query to search for
-        top_k: The number of results to return
-    """
-    engine = _get_engine()
-    results = engine.retrieve_with_deps(query, top_k=top_k)
-    results = _get_rules_store().apply_rules_to_query(query, results)
-    _track_unmatched_tokens(query)
-    _log_implicit_gt(query, results)
-    _auto_evolve()
-    return engine.format_results(results)
+    # ── rules 模块 ──
+    def _rules_list(rule_type: str = "", scope: str = "", min_confidence: float = 0.0, status: str = "") -> str:
+        store = _get_rules_store()
+        rules_list = store.list_rules(rule_type=rule_type or None, scope=scope or None, min_confidence=min_confidence, status=status or None)
+        out = [{"rule_id": r.rule_id, "type": r.rule_type, "desc": r.description, "condition": r.condition, "action": r.action, "confidence": round(r.effective_confidence, 4), "hits": r.hit_count, "accuracy": round(r.accuracy_rate, 4), "status": r.status} for r in rules_list]
+        return json.dumps({"count": len(out), "rules": out}, indent=2, ensure_ascii=False)
 
+    def _rules_add(rule_type: str, condition: str, description: str = "", rule_action: str = "", scope: str = "project", confidence: float = 0.8, source: str = "manual", tags: str = "", priority: int = 0, related_files: str = "") -> str:
+        store = _get_rules_store()
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+        file_list = [f.strip() for f in related_files.split(",") if f.strip()] if related_files else []
+        rule = Rule(rule_id="", rule_type=rule_type, scope=scope, description=description, condition=condition, action=rule_action, confidence=confidence, source=source, tags=tag_list, priority=priority, related_files=file_list)
+        conflicts = store.detect_conflicts(rule)
+        new_id = store.add_rule(rule)
+        result = {"rule_id": new_id, "status": rule.status, "confidence": round(rule.effective_confidence, 4)}
+        if conflicts:
+            result["conflicts"] = conflicts
+        return json.dumps(result, indent=2, ensure_ascii=False)
 
-@mcp.tool()
-def batch_retrieve(queries: list[str], top_k: int = 3) -> str:
-    """
-    Batch retrieve context for multiple queries at once.
-    More efficient than calling retrieve_context multiple times.
+    def _rules_apply(rule_id: str) -> str:
+        store = _get_rules_store()
+        rule = store.get_rule(rule_id)
+        if not rule:
+            return json.dumps({"error": f"Rule '{rule_id}' not found"})
+        store.record_hit(rule_id)
+        return json.dumps({"rule_id": rule_id, "hits": rule.hit_count + 1}, indent=2)
 
-    Args:
-        queries: List of queries to search for
-        top_k: Number of results per query
-    """
-    engine = _get_engine()
-    all_results = []
-    for i, q in enumerate(queries[:10]):
-        results = engine.retrieve(q, top_k=top_k)
-        formatted = engine.format_results(results)
-        all_results.append(f"## Query {i+1}: {q}\n\n{formatted}")
-    return "\n\n---\n\n".join(all_results)
+    def _rules_verify(rule_id: str, correct: bool = True) -> str:
+        store = _get_rules_store()
+        rule = store.get_rule(rule_id)
+        if not rule:
+            return json.dumps({"error": f"Rule '{rule_id}' not found"})
+        (store.record_verified if correct else store.record_rejected)(rule_id)
+        rule = store.get_rule(rule_id)
+        return json.dumps({"rule_id": rule_id, "correct": correct, "accuracy": round(rule.accuracy_rate, 4), "confidence": round(rule.effective_confidence, 4)}, indent=2)
 
+    def _rules_prune(min_hit_rate: float = 0.1, min_uses: int = 5) -> str:
+        store = _get_rules_store()
+        store.apply_decay()
+        pruned = store.prune_rules(min_hit_rate=min_hit_rate, min_uses=min_uses)
+        promoted = store.promote_observing_rules()
+        demoted = store.demote_failing_rules()
+        return json.dumps({"pruned": pruned, "promoted": promoted, "demoted": demoted, "remaining": len(store.list_rules(enabled_only=True, status="active"))}, indent=2)
 
-@mcp.tool()
-def compare_strategies(query: str) -> str:
-    """
-    Compare different retrieval strategies (full context, recent files, graph diffusion).
-    Shows token usage for each approach to evaluate savings.
+    def _rules_discover(top_k: int = 5) -> str:
+        engine = _get_engine()
+        store = _get_rules_store()
+        gt_path = engine.config.get("ground_truth_path", "ground_truth/opencode_ground_truth.json")
+        discovered = store.discover_rules_from_errors(engine, gt_path, top_k=top_k)
+        return json.dumps({"discovered": len(discovered), "rule_ids": discovered}, indent=2)
 
-    Args:
-        query: The query to compare strategies with
-    """
-    engine = _get_engine()
-    result = engine.compare_strategies(query)
-    return (
-        f"Query: {result['query']}\n"
-        f"Full Context: {result['full_context_tokens']} tokens\n"
-        f"Recent Files: {result['recent_files_tokens']} tokens\n"
-        f"Graph Diffusion: {result['graph_diffusion_tokens']} tokens\n"
-        f"Savings: {result['savings']}"
-    )
-
-
-@mcp.tool()
-def health_check() -> str:
-    """
-    Check the health status of the context engine.
-    Returns indexing stats, file watcher status, cache info, and MVCC version.
-    """
-    engine = _get_engine()
-    stats = engine.stats()
-    watcher_status = "running" if (engine.watcher and engine.watcher.is_running) else "stopped"
-    return json.dumps({
-        "status": "ok",
-        "version": "6.0.0",
-        "project_root": str(engine.project_root),
-        "indexed_files": len(engine._indexed_files),
-        "chunks": stats["chunks"],
-        "token_types": stats["token_types"],
-        "graph_edges": stats["graph_edges"],
-        "cache_size": stats["cache_size"],
-        "watcher": watcher_status,
-        "persist_path": engine.config.get("persist_path"),
-        "mvcc_version": stats.get("version", 0),
-        "snapshots_stored": stats.get("snapshots_stored", 0),
-    }, indent=2)
-
-
-@mcp.tool()
-def get_config() -> str:
-    """
-    Get the current engine configuration.
-    """
-    engine = _get_engine()
-    safe_config = {}
-    for k, v in engine.config.items():
-        if isinstance(v, (str, int, float, bool, type(None))):
-            safe_config[k] = v
-        elif isinstance(v, (set, list)):
-            safe_config[k] = sorted(v) if isinstance(v, set) else v
-        elif isinstance(v, dict):
-            safe_config[k] = {str(kk): vv for kk, vv in v.items()}
-    return json.dumps(safe_config, indent=2, ensure_ascii=False)
-
-
-@mcp.tool()
-def update_config(key: str, value: str) -> str:
-    """
-    Update a configuration value at runtime.
-    Supports: max_context_tokens, memory_top_k, max_hops, idf_boost_enabled,
-    idf_boost_weight, cache_max_size
-
-    Args:
-        key: Configuration key to update
-        value: New value (will be auto-parsed as int/float/bool if applicable)
-    """
-    engine = _get_engine()
-    allowed_keys = {
-        "max_context_tokens", "memory_top_k", "max_hops",
-        "idf_boost_enabled", "idf_boost_weight", "cache_max_size",
-        "adaptive_context", "adaptive_max_context_tokens",
+    MODULE_REGISTRY["rules"] = {
+        "description": "Rule management for LLM self-evolution. Accuracy-based decay.",
+        "tools": [
+            (_rules_list, "rules_list", "List retrieval rules. Optional filters: rule_type, scope, min_confidence, status."),
+            (_rules_add, "rules_add", "Add a new rule. Required: rule_type, condition. The rule enters observing period."),
+            (_rules_apply, "rules_apply", "Apply a rule (records a hit). Required: rule_id."),
+            (_rules_verify, "rules_verify", "Verify a rule as correct or incorrect. Required: rule_id."),
+            (_rules_prune, "rules_prune", "Prune low-performing rules. Params: min_hit_rate, min_uses."),
+            (_rules_discover, "rules_discover", "Auto-discover candidate rules from retrieval errors."),
+        ],
     }
-    if key not in allowed_keys:
-        return f"Error: key '{key}' not in allowed keys: {sorted(allowed_keys)}"
 
-    if value.lower() in ("true", "false"):
-        parsed = value.lower() == "true"
-    elif "." in value:
+    # ── admin 模块 ──
+    def _admin_health() -> str:
+        engine = _get_engine()
+        stats = engine.stats()
+        watcher = "running" if (engine.watcher and engine.watcher.is_running) else "stopped"
+        return json.dumps({"status": "ok", "project_root": str(engine.project_root), "indexed_files": len(engine._indexed_files), "chunks": stats["chunks"], "graph_edges": stats["graph_edges"], "cache_size": stats["cache_size"], "watcher": watcher, "mvcc_version": stats.get("version", 0)}, indent=2)
+
+    def _admin_config() -> str:
+        engine = _get_engine()
+        cfg = {}
+        for k, v in engine.config.items():
+            if isinstance(v, (str, int, float, bool, type(None))):
+                cfg[k] = v
+            elif isinstance(v, (set, list)):
+                cfg[k] = sorted(v) if isinstance(v, set) else v
+        return json.dumps(cfg, indent=2, ensure_ascii=False)
+
+    def _admin_update_config(key: str, value: str) -> str:
+        engine = _get_engine()
+        allowed = {"max_context_tokens", "memory_top_k", "max_hops", "idf_boost_enabled", "idf_boost_weight", "cache_max_size", "adaptive_context", "adaptive_max_context_tokens"}
+        if key not in allowed:
+            return json.dumps({"error": f"key not allowed", "valid": sorted(allowed)})
+        if value.lower() in ("true", "false"):
+            parsed = value.lower() == "true"
+        elif "." in value:
+            try: parsed = float(value)
+            except ValueError: parsed = value
+        else:
+            try: parsed = int(value)
+            except ValueError: parsed = value
+        engine.config[key] = parsed
+        engine.memory.invalidate_cache()
+        return json.dumps({"key": key, "value": parsed}, indent=2)
+
+    def _snapshot_create() -> str:
+        engine = _get_engine()
+        ver = engine.memory.snapshot()
+        return json.dumps({"version": ver, "chunks": len([c for c in engine.memory.chunks if c is not None])}, indent=2)
+
+    def _snapshot_read(version: int) -> str:
+        engine = _get_engine()
         try:
-            parsed = float(value)
-        except ValueError:
-            parsed = value
-    else:
-        try:
-            parsed = int(value)
-        except ValueError:
-            parsed = value
+            snap = engine.memory.read_at(version)
+            return json.dumps({"version": version, "active": sum(1 for c in snap.get("chunks", []) if c is not None), "files": len(snap.get("file_chunks", {}))}, indent=2)
+        except KeyError as e:
+            return json.dumps({"error": str(e)})
 
-    engine.config[key] = parsed
-    engine.memory.invalidate_cache()
-    return f"Updated {key} = {parsed}"
+    def _snapshot_status() -> str:
+        engine = _get_engine()
+        stats = engine.memory.stats()
+        return json.dumps({"current_version": engine.memory.current_version, "snapshots": len(engine.memory._snapshots), "chunks": stats["chunks"]}, indent=2)
 
+    def _scope_create(project_id: str, root: str, isolation: str = "strict", description: str = "") -> str:
+        manager = _get_scope_manager()
+        if not project_id or not root:
+            return json.dumps({"error": "project_id and root required"})
+        if manager.get_scope(project_id):
+            return json.dumps({"error": f"Scope '{project_id}' already exists"})
+        root_resolved = str(Path(root).resolve())
+        config = dict(DEFAULT_CONFIG)
+        for ek, ck, t in [("MCP_MAX_TOKENS","max_context_tokens",int),("MCP_TOP_K","memory_top_k",int),("MCP_MAX_HOPS","max_hops",int),("MCP_CACHE_SIZE","cache_max_size",int)]:
+            if os.environ.get(ek): config[ck] = t(os.environ[ek])
+        eng = VibeCodingEngine(root_resolved, config)
+        eng.index_project(); eng.start_watching()
+        s = manager.create_scope(project_id=project_id, root=root_resolved, isolation=isolation, description=description)
+        manager.bind_engine(project_id, eng)
+        return json.dumps({"project_id": s.project_id, "root": s.root, "message": "created"}, indent=2)
 
-# ══════════════════════════════════════════════════
-#  V6 工具 -- MVCC 快照
-# ══════════════════════════════════════════════════
+    def _scope_list() -> str:
+        manager = _get_scope_manager()
+        scopes = manager.list_scopes()
+        out = [{"id": s.project_id, "root": s.root, "isolation": s.isolation} for s in scopes]
+        return json.dumps({"total": len(out), "scopes": out}, indent=2)
 
-@mcp.tool()
-def create_snapshot() -> str:
-    """
-    Create a MVCC snapshot of the current engine state.
-    Returns the version number of the snapshot.
-    Useful for multi-agent read-write isolation.
-    """
-    engine = _get_engine()
-    version = engine.memory.snapshot()
-    return json.dumps({
-        "version": version,
-        "message": f"Snapshot created at version {version}",
-        "chunks": len([c for c in engine.memory.chunks if c is not None]),
-    }, indent=2)
+    def _scope_link(project_a: str, project_b: str, link_type: str = "reference") -> str:
+        manager = _get_scope_manager()
+        if not project_a or not project_b:
+            return json.dumps({"error": "project_a and project_b required"})
+        ok = manager.link_projects(project_a=project_a, project_b=project_b, link_type=link_type)
+        return json.dumps({"linked": ok, "link_type": link_type}, indent=2)
 
+    def _synonym_add(cn_term: str, en_terms: str) -> str:
+        _ensure_custom_synonyms()
+        if not cn_term or not en_terms:
+            return json.dumps({"error": "cn_term and en_terms required"})
+        en_list = [e.strip() for e in en_terms.split(",") if e.strip()]
+        with _synonyms_lock:
+            if cn_term not in _custom_synonyms: _custom_synonyms[cn_term] = []
+            added = [e for e in en_list if e not in _custom_synonyms[cn_term]]
+            _custom_synonyms[cn_term].extend(added)
+            _save_custom_synonyms()
+            if cn_term not in _synonyms_mod.SYNONYM_MAP: _synonyms_mod.SYNONYM_MAP[cn_term] = []
+            for e in added:
+                _synonyms_mod.SYNONYM_MAP[cn_term].append(e)
+                _synonyms_mod._REVERSE_MAP.setdefault(e, []).append(cn_term)
+        return json.dumps({"cn_term": cn_term, "added": added}, indent=2, ensure_ascii=False)
 
-@mcp.tool()
-def read_at_version(version: int) -> str:
-    """
-    Read engine state at a specific MVCC version.
-    Returns metadata about the snapshot (not full content, for efficiency).
+    def _synonym_discover(top_k: int = 10) -> str:
+        _ensure_custom_synonyms()
+        with _synonyms_lock:
+            if not _unmatched_tokens_log:
+                return json.dumps({"count": 0, "message": "No unmatched tokens yet"}, indent=2)
+            from collections import Counter
+            counts = Counter(i["token"] for i in _unmatched_tokens_log)
+            candidates = [{"cn": t, "freq": c} for t, c in counts.most_common(top_k) if t not in _synonyms_mod.SYNONYM_MAP and not any(k in t for k in _synonyms_mod.SYNONYM_MAP)]
+        return json.dumps({"count": len(candidates), "candidates": candidates}, indent=2, ensure_ascii=False)
 
-    Args:
-        version: The version number to read at
-    """
-    engine = _get_engine()
-    try:
-        snap = engine.memory.read_at(version)
-        chunks = snap.get("chunks", [])
-        active = sum(1 for c in chunks if c is not None)
-        return json.dumps({
-            "version": version,
-            "timestamp": snap.get("timestamp", 0),
-            "active_chunks": active,
-            "total_chunks": len(chunks),
-            "files": len(snap.get("file_chunks", {})),
-            "token_types": len(snap.get("token_to_chunks", {})),
-        }, indent=2)
-    except KeyError as e:
-        return json.dumps({"error": str(e)})
-
-
-@mcp.tool()
-def get_mvcc_status() -> str:
-    """
-    Get MVCC status: current version, stored snapshots, etc.
-    """
-    engine = _get_engine()
-    stats = engine.memory.stats()
-    snapshot_versions = sorted(engine.memory._snapshots.keys())
-    return json.dumps({
-        "current_version": engine.memory.current_version,
-        "snapshots_stored": len(snapshot_versions),
-        "snapshot_versions": snapshot_versions,
-        "max_snapshots": engine.config.get("mvcc_max_snapshots", 10),
-        "chunks": stats["chunks"],
-        "files": stats["files"],
-    }, indent=2)
-
-
-# ══════════════════════════════════════════════════
-#  V6 工具 -- 规则管理
-# ══════════════════════════════════════════════════
-
-@mcp.tool()
-def add_rule(
-    rule_type: str,
-    description: str,
-    condition: str,
-    action: str,
-    scope: str = "project",
-    confidence: float = 0.8,
-    source: str = "manual",
-    tags: list[str] = None,
-    priority: int = 0,
-    related_files: list[str] = None,
-) -> str:
-    """
-    Add a new rule to the rules store.
-    Rules use accuracy-based decay (not time-based): they stay valid as long as they prove correct.
-
-    Args:
-        rule_type: Type of rule: "pattern", "preference", or "constraint"
-        description: Human-readable description of the rule
-        condition: Trigger condition (tokenized for matching, not substring)
-        action: Suggested action when condition is met
-        scope: "project" or "global"
-        confidence: Initial confidence (0.0-1.0)
-        source: "auto", "manual", or "community"
-        tags: Optional tags for categorization
-        priority: Priority level (higher = checked first, used for conflict resolution)
-        related_files: Files this rule relates to (for code-change-aware decay)
-    """
-    store = _get_rules_store()
-
-    rule = Rule(
-        rule_id="",
-        rule_type=rule_type,
-        scope=scope,
-        description=description,
-        condition=condition,
-        action=action,
-        confidence=confidence,
-        source=source,
-        tags=tags or [],
-        priority=priority,
-        related_files=related_files or [],
-    )
-    conflicts = store.detect_conflicts(rule)
-
-    rule_id = store.add_rule(rule)
-    result = {
-        "rule_id": rule_id,
-        "status": rule.status,
-        "message": f"Rule added: {rule_id} (status: {rule.status})",
-        "effective_confidence": round(rule.effective_confidence, 4),
+    MODULE_REGISTRY["admin"] = {
+        "description": "Engine config, snapshots, scopes, synonyms. Rarely needed by LLM.",
+        "tools": [
+            (_admin_health, "admin_health", "Check engine health: index stats, watcher, cache, MVCC version."),
+            (_admin_config, "admin_config", "Get current engine configuration."),
+            (_admin_update_config, "admin_update_config", "Update config at runtime. Required: key, value."),
+            (_snapshot_create, "snapshot_create", "Create MVCC snapshot for multi-agent isolation."),
+            (_snapshot_read, "snapshot_read", "Read snapshot at a specific version. Required: version."),
+            (_snapshot_status, "snapshot_status", "Get MVCC status: current version, snapshot count."),
+            (_scope_create, "scope_create", "Create project scope. Required: project_id, root."),
+            (_scope_list, "scope_list", "List all project scopes."),
+            (_scope_link, "scope_link", "Link two projects. Required: project_a, project_b."),
+            (_synonym_add, "synonym_add", "Add Chinese-English synonym. Required: cn_term, en_terms (comma-separated)."),
+            (_synonym_discover, "synonym_discover", "Discover candidate synonyms from unmatched query tokens."),
+        ],
     }
-    if conflicts:
-        result["conflicts"] = conflicts
-        result["conflict_warning"] = f"Found {len(conflicts)} potential conflict(s) with existing rules"
-    return json.dumps(result, indent=2, ensure_ascii=False)
-
-
-@mcp.tool()
-def list_rules(
-    rule_type: str = "",
-    scope: str = "",
-    min_confidence: float = 0.0,
-    status: str = "",
-) -> str:
-    """
-    List rules in the store, with optional filters.
-
-    Args:
-        rule_type: Filter by type ("pattern", "preference", "constraint") or empty for all
-        scope: Filter by scope ("project", "global") or empty for all
-        min_confidence: Minimum effective confidence threshold
-        status: Filter by status ("observing", "active", "disabled") or empty for all
-    """
-    store = _get_rules_store()
-    rules = store.list_rules(
-        rule_type=rule_type or None,
-        scope=scope or None,
-        min_confidence=min_confidence,
-        status=status or None,
-    )
-    result = []
-    for r in rules:
-        result.append({
-            "rule_id": r.rule_id,
-            "rule_type": r.rule_type,
-            "scope": r.scope,
-            "description": r.description,
-            "condition": r.condition,
-            "action": r.action,
-            "confidence": r.confidence,
-            "effective_confidence": round(r.effective_confidence, 4),
-            "hit_count": r.hit_count,
-            "miss_count": r.miss_count,
-            "hit_rate": round(r.hit_rate, 4),
-            "accuracy_rate": round(r.accuracy_rate, 4),
-            "verified_count": r.verified_count,
-            "rejected_count": r.rejected_count,
-            "source": r.source,
-            "status": r.status,
-            "enabled": r.enabled,
-            "priority": r.priority,
-        })
-    return json.dumps({
-        "count": len(result),
-        "rules": result,
-    }, indent=2, ensure_ascii=False)
-
-
-@mcp.tool()
-def evaluate_rules() -> str:
-    """
-    Evaluate rule effectiveness using ground truth data.
-    Compares retrieval accuracy with and without rules applied.
-    """
-    engine = _get_engine()
-    store = _get_rules_store()
-    result = store.evaluate_rules(engine)
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool()
-def apply_rule(rule_id: str) -> str:
-    """
-    Apply a specific rule to the retrieval pipeline.
-    Records a hit for the rule and returns its details.
-
-    Args:
-        rule_id: The ID of the rule to apply
-    """
-    store = _get_rules_store()
-    rule = store.get_rule(rule_id)
-    if rule is None:
-        return json.dumps({"error": f"Rule '{rule_id}' not found"})
-    store.record_hit(rule_id)
-    return json.dumps({
-        "rule_id": rule.rule_id,
-        "description": rule.description,
-        "condition": rule.condition,
-        "action": rule.action,
-        "effective_confidence": round(rule.effective_confidence, 4),
-        "hit_count": rule.hit_count + 1,
-        "message": "Rule applied, hit recorded",
-    }, indent=2)
-
-
-@mcp.tool()
-def prune_rules(min_hit_rate: float = 0.1, min_uses: int = 5) -> str:
-    """
-    Prune low-performing rules.
-    Rules with hit rate below threshold and enough usage data will be disabled.
-    Uses accuracy-based decay (not time-based).
-
-    Args:
-        min_hit_rate: Minimum hit rate threshold (default 0.1)
-        min_uses: Minimum number of uses before pruning (default 5)
-    """
-    store = _get_rules_store()
-    decay_disabled = store.apply_decay()
-    pruned = store.prune_rules(min_hit_rate=min_hit_rate, min_uses=min_uses)
-    promoted = store.promote_observing_rules()
-    demoted = store.demote_failing_rules()
-    return json.dumps({
-        "decay_disabled": decay_disabled,
-        "pruned": pruned,
-        "promoted_from_observing": promoted,
-        "demoted_from_observing": demoted,
-        "total_disabled": len(decay_disabled) + len(pruned) + len(demoted),
-        "total_promoted": len(promoted),
-        "remaining_active": len(store.list_rules(enabled_only=True, status="active")),
-    }, indent=2)
-
-
-@mcp.tool()
-def verify_rule(rule_id: str, correct: bool = True) -> str:
-    """
-    Verify a rule's effectiveness based on user feedback.
-    This is the core of accuracy-based decay: rules stay valid as long as they're verified correct.
-
-    Args:
-        rule_id: The ID of the rule to verify
-        correct: True if the rule was helpful, False if it was wrong
-    """
-    store = _get_rules_store()
-    rule = store.get_rule(rule_id)
-    if rule is None:
-        return json.dumps({"error": f"Rule '{rule_id}' not found"})
-
-    if correct:
-        store.record_verified(rule_id)
-    else:
-        store.record_rejected(rule_id)
-
-    rule = store.get_rule(rule_id)
-    return json.dumps({
-        "rule_id": rule_id,
-        "verified_count": rule.verified_count,
-        "rejected_count": rule.rejected_count,
-        "accuracy_rate": round(rule.accuracy_rate, 4),
-        "effective_confidence": round(rule.effective_confidence, 4),
-        "message": f"Rule {'verified' if correct else 'rejected'}",
-    }, indent=2)
-
-
-@mcp.tool()
-def check_rule_conflicts(
-    rule_type: str,
-    condition: str,
-    action: str,
-) -> str:
-    """
-    Check if a new rule would conflict with existing rules before adding it.
-    Returns conflict details and recommendations.
-
-    Args:
-        rule_type: Type of the proposed rule
-        condition: Condition of the proposed rule
-        action: Action of the proposed rule
-    """
-    store = _get_rules_store()
-    proposed = Rule(
-        rule_id="",
-        rule_type=rule_type,
-        scope="project",
-        description="conflict check",
-        condition=condition,
-        action=action,
-        confidence=0.5,
-    )
-    conflicts = store.detect_conflicts(proposed)
-    return json.dumps({
-        "has_conflicts": len(conflicts) > 0,
-        "conflict_count": len(conflicts),
-        "conflicts": conflicts,
-    }, indent=2, ensure_ascii=False)
-
-
-@mcp.tool()
-def discover_rules(top_k: int = 5) -> str:
-    """
-    Auto-discover candidate rules from Ground Truth evaluation errors.
-    Analyzes missed queries and suggests rules to improve retrieval.
-    New rules enter 'observing' mode for validation.
-    """
-    engine = _get_engine()
-    store = _get_rules_store()
-    gt_path = engine.config.get("ground_truth_path", "ground_truth/opencode_ground_truth.json")
-    discovered = store.discover_rules_from_errors(engine, gt_path, top_k=top_k)
-    return json.dumps({
-        "discovered_count": len(discovered),
-        "rule_ids": discovered,
-        "message": f"Discovered {len(discovered)} candidate rules (status: observing)",
-    }, indent=2)
-
-
-@mcp.tool()
-def check_code_freshness() -> str:
-    """
-    Check if rules' related files have been modified.
-    Rules tied to rewritten code will have their confidence reduced.
-    """
-    engine = _get_engine()
-    store = _get_rules_store()
-    affected = store.check_code_freshness(engine)
-    return json.dumps({
-        "affected_rules": affected,
-        "count": len(affected),
-        "message": f"{len(affected)} rules affected by code changes",
-    }, indent=2)
 
 
 # ══════════════════════════════════════════════════
-#  V6 工具 -- 项目作用域
+#  Tool 1: search — 代码检索（始终加载）
 # ══════════════════════════════════════════════════
 
 @mcp.tool()
-def create_scope(
-    project_id: str,
-    root: str,
-    isolation: str = "strict",
-    description: str = "",
-    tags: list[str] = None,
-) -> str:
+def search(query: str, top_k: int = 5, mode: str = "graph") -> str:
     """
-    Create a new project scope.
-    Each scope manages its own index and can be isolated or shared.
+    Search project code using AST call graph + BM25 ranking.
+
+    Modes:
+      - graph: BM25 + graph diffusion (default, best for most queries)
+      - deps:  graph + cross-file dependency expansion
 
     Args:
-        project_id: Unique project identifier
-        root: Project root directory path
-        isolation: "strict" (independent index) or "shared" (can reference other projects)
-        description: Project description
-        tags: Optional tags
+        query: Natural language or code term to search for
+        top_k: Number of results (default 5, max 20)
+        mode: "graph" or "deps"
     """
-    manager = _get_scope_manager()
-    if manager.get_scope(project_id):
-        return json.dumps({"error": f"Scope '{project_id}' already exists"})
-
-    root_resolved = str(Path(root).resolve())
-    tags_list = tags or []
-
-    # 1. Create engine first (may fail -- scope won't be persisted as zombie)
-    config = dict(DEFAULT_CONFIG)
-    if os.environ.get("MCP_MAX_TOKENS"):
-        config["max_context_tokens"] = int(os.environ["MCP_MAX_TOKENS"])
-    if os.environ.get("MCP_TOP_K"):
-        config["memory_top_k"] = int(os.environ["MCP_TOP_K"])
-    if os.environ.get("MCP_MAX_HOPS"):
-        config["max_hops"] = int(os.environ["MCP_MAX_HOPS"])
-    if os.environ.get("MCP_CACHE_SIZE"):
-        config["cache_max_size"] = int(os.environ["MCP_CACHE_SIZE"])
-
-    engine = VibeCodingEngine(root_resolved, config)
-    engine.index_project()
-    engine.start_watching()
-
-    # 2. Engine ready -- persist scope data and bind
-    scope = manager.create_scope(
-        project_id=project_id,
-        root=root_resolved,
-        isolation=isolation,
-        description=description,
-        tags=tags_list,
-    )
-    manager.bind_engine(project_id, engine)
-
-    return json.dumps({
-        "project_id": scope.project_id,
-        "root": scope.root,
-        "isolation": scope.isolation,
-        "message": f"Scope '{project_id}' created and engine bound",
-    }, indent=2)
-
-
-@mcp.tool()
-def link_projects(
-    project_a: str,
-    project_b: str,
-    link_type: str = "reference",
-    shared_rules: list[str] = None,
-    shared_patterns: list[str] = None,
-) -> str:
-    """
-    Link two projects together.
-    Enables cross-project pattern sharing and searching.
-
-    Args:
-        project_a: First project ID
-        project_b: Second project ID
-        link_type: "reference" (one-way), "bidirectional" (two-way), "shared" (full sharing)
-        shared_rules: Rule IDs to share between projects
-        shared_patterns: Pattern names to share
-    """
-    manager = _get_scope_manager()
-    success = manager.link_projects(
-        project_a=project_a,
-        project_b=project_b,
-        link_type=link_type,
-        shared_rules=shared_rules,
-        shared_patterns=shared_patterns,
-    )
-    if success:
-        return json.dumps({
-            "message": f"Projects '{project_a}' and '{project_b}' linked",
-            "link_type": link_type,
-        })
-    else:
-        return json.dumps({"error": "Failed to link projects. Check that both projects exist."})
-
-
-@mcp.tool()
-def search_across_projects(
-    query: str,
-    source_project: str = "",
-    top_k: int = 5,
-    aggregate: bool = True,
-) -> str:
-    """
-    Search for patterns across linked projects.
-    Returns aggregated pattern summaries (no code content) for security.
-    Patterns are clustered by name across projects.
-
-    Args:
-        query: Search query
-        source_project: Source project ID (empty to search all)
-        top_k: Maximum results per project
-        aggregate: If true, aggregate patterns across projects; if false, return flat list
-    """
-    manager = _get_scope_manager()
-    results = manager.search_across_projects(
-        query=query,
-        source_project=source_project or None,
-        top_k=top_k,
-        aggregate=aggregate,
-    )
-    if aggregate:
-        result = [r.to_dict() for r in results]
-    else:
-        result = [r.to_dict() for r in results]
-    return json.dumps({
-        "count": len(result),
-        "aggregated": aggregate,
-        "patterns": result,
-    }, indent=2, ensure_ascii=False)
-
-
-@mcp.tool()
-def list_scopes() -> str:
-    """
-    List all project scopes with their configuration and stats.
-    """
-    manager = _get_scope_manager()
-    scopes = manager.list_scopes()
-    result = []
-    for s in scopes:
-        result.append({
-            "project_id": s.project_id,
-            "root": s.root,
-            "isolation": s.isolation,
-            "description": s.description,
-            "shared_rules": s.shared_rules,
-            "shared_patterns": s.shared_patterns,
-            "cross_references": list(s.cross_references.keys()),
-            "tags": s.tags,
-        })
-    stats = {
-        "total_projects": len(scopes),
-        "strict_projects": sum(1 for s in scopes if s.isolation == "strict"),
-        "shared_projects": sum(1 for s in scopes if s.isolation == "shared"),
-        "total_links": sum(len(s.cross_references) for s in scopes) // 2,
-        "engines_bound": len(manager._engines) if hasattr(manager, "_engines") else 0,
-    }
-    return json.dumps({
-        "stats": stats,
-        "scopes": result,
-    }, indent=2, ensure_ascii=False)
-
-
-@mcp.tool()
-def add_synonym(cn_term: str, en_terms: list[str]) -> str:
-    """
-    Add a Chinese-English synonym mapping.
-    New terms are immediately available for query expansion and persisted
-    across restarts.
-
-    Args:
-        cn_term: Chinese term (e.g. "样品")
-        en_terms: English code identifiers (e.g. ["sample", "specimen", "aliquot"])
-    """
-    _ensure_custom_synonyms()
-    if not cn_term or not en_terms:
-        return json.dumps({"error": "cn_term and en_terms required"}, indent=2)
-
-    with _synonyms_lock:
-        # 更新自定义同义词持久化
-        if cn_term not in _custom_synonyms:
-            _custom_synonyms[cn_term] = []
-        added = []
-        for en in en_terms:
-            if en not in _custom_synonyms[cn_term]:
-                _custom_synonyms[cn_term].append(en)
-                added.append(en)
-        _save_custom_synonyms()
-
-        # 注入到运行时模块
-        if cn_term not in _synonyms_mod.SYNONYM_MAP:
-            _synonyms_mod.SYNONYM_MAP[cn_term] = []
-        for en in added:
-            if en not in _synonyms_mod.SYNONYM_MAP[cn_term]:
-                _synonyms_mod.SYNONYM_MAP[cn_term].append(en)
-                _synonyms_mod._REVERSE_MAP.setdefault(en, []).append(cn_term)
-
-    return json.dumps({
-        "cn_term": cn_term,
-        "added": added,
-        "total_mappings": len(_custom_synonyms),
-        "message": f"Synonym '{cn_term}' -> {added} added",
-    }, indent=2, ensure_ascii=False)
-
-
-@mcp.tool()
-def discover_synonyms() -> str:
-    """
-    Discover candidate Chinese-English synonym mappings from recent queries.
-    Analyzes unmatched Chinese tokens and co-occurring English identifiers
-    in retrieval results. Returns candidate suggestions.
-
-    The LLM can review these candidates and add them with add_synonym().
-    """
-    _ensure_custom_synonyms()
-    with _synonyms_lock:
-        if not _unmatched_tokens_log:
-            return json.dumps({
-                "count": 0,
-                "candidates": [],
-                "message": "No unmatched Chinese tokens found. Make some queries with Chinese terms first.",
-            }, indent=2, ensure_ascii=False)
-
-        # 统计未匹配 token 频率
-        from collections import Counter
-        token_counts = Counter(item["token"] for item in _unmatched_tokens_log)
-
-        # 过滤已在同义词表中的
-        candidates = []
-        for token, count in token_counts.most_common(20):
-            if token in _synonyms_mod.SYNONYM_MAP:
-                continue
-            exists = any(key in token for key in _synonyms_mod.SYNONYM_MAP)
-            if exists:
-                continue
-            candidates.append({
-                "cn_term": token,
-                "frequency": count,
-                "suggestion": f"Consider mapping '{token}' to its English counterpart",
-            })
-
-    return json.dumps({
-        "count": len(candidates),
-        "candidates": candidates,
-        "total_unmatched_logged": len(_unmatched_tokens_log),
-        "message": "Use add_synonym() to add a mapping for any candidate above",
-    }, indent=2, ensure_ascii=False)
+    engine = _get_engine()
+    top_k = min(max(top_k, 1), 20)
+    fn = engine.retrieve_with_deps if mode == "deps" else engine.retrieve
+    results = fn(query, top_k=top_k)
+    results = _post_retrieve(query, results)
+    return engine.format_results(results)
 
 
 # ══════════════════════════════════════════════════
-#  资源定义
+#  Tool 2: tools — 动态工具管理器（始终加载）
+# ══════════════════════════════════════════════════
+
+@mcp.tool()
+def tools(action: str = "list", module: str = "", ctx: Context = None) -> str:
+    """
+    Dynamic tool loader. Load/unload tool modules on demand to save context tokens.
+
+    Actions:
+      - list:   Show available modules and their status (loaded/unloaded)
+      - load:   Load a module's tools into the session. Sends tools/list_changed notification.
+      - unload: Unload a module's tools from the session.
+      - loaded: Show currently loaded tools.
+
+    Args:
+        action: Operation (list|load|unload|loaded)
+        module: Module name to load/unload (for load/unload)
+    """
+    _ensure_registry()
+    loaded = _get_loaded_modules(ctx)
+
+    if action == "list":
+        result = {}
+        for name, mod in MODULE_REGISTRY.items():
+            tool_names = [t[1] for t in mod["tools"]]
+            result[name] = {
+                "description": mod["description"],
+                "tools": tool_names,
+                "loaded": name in loaded,
+            }
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    elif action == "load":
+        if not module:
+            return json.dumps({"error": "module name required", "available": list(MODULE_REGISTRY.keys())})
+        if module not in MODULE_REGISTRY:
+            return json.dumps({"error": f"Unknown module '{module}'", "available": list(MODULE_REGISTRY.keys())})
+        if module in loaded:
+            return json.dumps({"message": f"Module '{module}' already loaded", "tools": [t[1] for t in MODULE_REGISTRY[module]["tools"]]})
+
+        mod = MODULE_REGISTRY[module]
+        registered = []
+        for fn, name, desc in mod["tools"]:
+            mcp.add_tool(fn, name=name, description=desc)
+            registered.append(name)
+        loaded.add(module)
+
+        # 通知客户端工具列表已变更
+        notified = False
+        if ctx and hasattr(ctx, "session"):
+            try:
+                ctx.session.send_tool_list_changed()
+                notified = True
+            except Exception:
+                pass
+
+        result = {
+            "module": module,
+            "loaded": registered,
+            "message": f"Loaded {len(registered)} tools.",
+        }
+        if not notified:
+            result["hint"] = (
+                "Client did not acknowledge tools/list_changed notification. "
+                "If these tools appear as 'unknown', please start a new conversation "
+                "or re-request the tool list to pick them up."
+            )
+        return json.dumps(result, indent=2)
+
+    elif action == "unload":
+        if not module:
+            return json.dumps({"error": "module name required"})
+        if module not in loaded:
+            return json.dumps({"error": f"Module '{module}' not loaded"})
+        mod = MODULE_REGISTRY[module]
+        removed = []
+        for _, name, _ in mod["tools"]:
+            try:
+                mcp.remove_tool(name)
+                removed.append(name)
+            except Exception:
+                pass
+        loaded.discard(module)
+
+        notified = False
+        if ctx and hasattr(ctx, "session"):
+            try:
+                ctx.session.send_tool_list_changed()
+                notified = True
+            except Exception:
+                pass
+
+        result = {
+            "module": module,
+            "unloaded": removed,
+            "message": f"Unloaded {len(removed)} tools.",
+        }
+        if not notified:
+            result["hint"] = "Client did not acknowledge tools/list_changed notification."
+        return json.dumps(result, indent=2)
+
+    elif action == "loaded":
+        all_tools = []
+        for mod_name in loaded:
+            mod = MODULE_REGISTRY.get(mod_name, {})
+            for _, name, desc in mod.get("tools", []):
+                all_tools.append({"name": name, "module": mod_name, "desc": desc[:60]})
+        return json.dumps({"loaded_modules": sorted(loaded), "tools": all_tools}, indent=2, ensure_ascii=False)
+
+    else:
+        return json.dumps({"error": f"Unknown action '{action}'", "valid": ["list", "load", "unload", "loaded"]})
+
+
+# ══════════════════════════════════════════════════
+#  资源
 # ══════════════════════════════════════════════════
 
 @mcp.resource("context://stats")
 def get_stats() -> str:
-    """Get current index statistics as a resource."""
     engine = _get_engine()
-    stats = engine.stats()
-    return json.dumps(stats, indent=2)
+    return json.dumps(engine.stats(), indent=2)
 
 
 def main():

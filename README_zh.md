@@ -87,58 +87,82 @@ for score, chunk in results:
     print(f"[{score:.2f}] {chunk.file_path}:{chunk.name}")
 ```
 
-## MCP 工具一览
+## MCP 工具 — 动态加载
 
-### 检索工具
+**v6 架构：** 启动时只注入 2 个工具（~270 tokens），其他工具通过 `tools` 管理器按需加载，大幅减少每轮对话的上下文开销。
 
-| 工具 | 说明 |
-|------|------|
-| `retrieve_context` | 基础检索：BM25 + AST 调用图 |
-| `retrieve_context_adaptive` | 自适应策略：小项目全量评分，大项目图扩散 |
-| `retrieve_with_dependencies` | 检索 + 跨文件依赖（函数→调用方一跳直达） |
-| `batch_retrieve` | 批量检索，一次查多个问题 |
-| `compare_strategies` | 对比不同策略的 token 消耗 |
+| 阶段 | 工具数 | Token 开销 |
+|------|--------|-----------|
+| 启动 | `search` + `tools` | ~270 tokens |
+| + `rules` 模块 | +6 个工具 | ~770 tokens |
+| + `admin` 模块 | +11 个工具 | ~1,670 tokens |
+| 全量注入（旧版） | 25+ 个工具 | ~3,000-4,000 tokens |
 
-### MVCC 快照（多 Agent 协同）
+### 始终加载（启动时）
 
-| 工具 | 说明 |
-|------|------|
-| `create_snapshot` | 创建 MVCC 快照（COW，无 deepcopy） |
-| `read_at_version` | 读取指定版本的索引状态 |
-| `get_mvcc_status` | 查看当前版本和快照列表 |
+#### `search` — 代码检索
 
-**多 Agent 场景：** 每个 Agent 创建独立快照，读写互不干扰。Agent A 写入新索引不影响 Agent B 正在读的版本。共享底层索引，零冗余。
+基于 AST 调用图 + BM25 精排的代码检索。
 
-### 规则引擎（自进化）
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `query` | string | 必填 | 自然语言或代码术语 |
+| `top_k` | int | 5 | 返回结果数（最大 20） |
+| `mode` | string | `"graph"` | `"graph"`（BM25 + 图扩散）或 `"deps"`（+ 跨文件依赖） |
 
-| 工具 | 说明 |
-|------|------|
-| `add_rule` | 添加规则（自动进入观察期） |
-| `list_rules` | 列出规则（支持按类型/作用域/置信度过滤） |
-| `evaluate_rules` | 用 Ground Truth 评估规则效果 |
-| `apply_rule` | 应用规则到检索流程 |
-| `verify_rule` | 验证规则（正确/错误），驱动准确率衰减 |
-| `prune_rules` | 淘汰低效规则 |
-| `discover_rules` | 从 Ground Truth 错误中自动发现候选规则 |
-| `check_rule_conflicts` | 检测规则冲突 |
-| `check_code_freshness` | 检查规则关联的代码是否已变更 |
+#### `tools` — 动态工具管理器
 
-### 项目作用域（多项目管理）
+按需加载/卸载工具模块，节省上下文 token。
 
-| 工具 | 说明 |
-|------|------|
-| `create_scope` | 创建项目作用域（strict 隔离 / shared 打通） |
-| `link_projects` | 关联项目（单向/双向/完全共享） |
-| `search_across_projects` | 跨项目搜索模式（只返回模式，不返回代码） |
-| `list_scopes` | 列出所有项目作用域 |
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `action` | string | `"list"` | `list` / `load` / `unload` / `loaded` |
+| `module` | string | `""` | 要加载/卸载的模块名 |
 
-### 系统工具
+**使用示例（LLM 调用）：**
+```
+tools(action="list")                          # 查看可用模块
+tools(action="load", module="rules")          # 加载规则工具
+tools(action="unload", module="rules")        # 用完卸载
+tools(action="loaded")                        # 查看已加载的工具
+```
+
+### 模块：`rules` — 自进化规则引擎
+
+加载方式：`tools(action="load", module="rules")`
 
 | 工具 | 说明 |
 |------|------|
-| `health_check` | 引擎健康检查（索引状态、文件监听、缓存、MVCC） |
-| `get_config` | 获取当前配置 |
-| `update_config` | 运行时更新配置 |
+| `rules_list` | 列出检索规则（支持按类型/作用域/置信度/状态过滤） |
+| `rules_add` | 添加新规则（自动进入观察期） |
+| `rules_apply` | 应用规则（记录命中） |
+| `rules_verify` | 验证规则（正确/错误），驱动准确率衰减 |
+| `rules_prune` | 淘汰低效规则 |
+| `rules_discover` | 从检索错误中自动发现候选规则 |
+
+### 模块：`admin` — 引擎配置、快照、作用域
+
+加载方式：`tools(action="load", module="admin")`
+
+| 工具 | 说明 |
+|------|------|
+| `admin_health` | 引擎健康检查（索引状态、文件监听、缓存、MVCC 版本） |
+| `admin_config` | 获取当前引擎配置 |
+| `admin_update_config` | 运行时更新配置 |
+| `snapshot_create` | 创建 MVCC 快照（COW，无 deepcopy） |
+| `snapshot_read` | 读取指定版本的快照 |
+| `snapshot_status` | 查看 MVCC 状态 |
+| `scope_create` | 创建项目作用域（strict 隔离 / shared 打通） |
+| `scope_list` | 列出所有项目作用域 |
+| `scope_link` | 关联两个项目 |
+| `synonym_add` | 添加中英文同义词映射 |
+| `synonym_discover` | 从未匹配的查询 token 中发现候选同义词 |
+
+### 资源
+
+| URI | 说明 |
+|-----|------|
+| `context://stats` | 引擎统计信息（chunks、edges、cache） |
 
 ## 配置
 
@@ -156,6 +180,22 @@ for score, chunk in results:
 | `MCP_SCOPES_PATH` | `scopes/scopes.json` | 作用域存储路径 |
 
 ## Token 节省原理
+
+### 工具定义开销
+
+每轮对话都会携带工具定义作为上下文。动态加载大幅降低这部分开销：
+
+```
+旧版（全量注入 25+ 个工具）:
+  每轮: ~3,500 tokens 工具定义
+  10 轮对话: 仅工具定义就消耗 ~35,000 tokens
+
+动态加载（v6）:
+  启动: ~270 tokens（search + tools）
+  10 轮对话（仅 search）: ~2,700 tokens
+  10 轮对话（search + rules）: ~7,700 tokens
+  节省: 78-92% 工具定义开销
+```
 
 ### 单 Agent 场景
 
@@ -202,6 +242,24 @@ Graph Context（3 个 Agent 共享索引）:
   节省: 87%+
 ```
 
+## Benchmark 结果
+
+使用内置 Token 消耗模拟器测试（`python -m tests.token_simulation`）：
+
+| 项目规模 | BM25 召回率 | BM25 + 规则 | Token 节省率 | 创建规则数 |
+|---------|------------|------------|-------------|-----------|
+| Small（4 模块） | 100% | 100% | 76.3% | 0 |
+| Medium（10 模块） | 85% → 100% | 100% | 88.7% | 4 |
+| Large（14 模块） | 80% → 100% | 97% | 90.7% | 6 |
+
+费用对比（Large 项目，Claude 3.5 Sonnet）：
+
+| 场景 | 费用 |
+|------|------|
+| 无 MCP | ¥14.83 |
+| 有 MCP（含规则） | ¥3.30 |
+| **节省** | **78%** |
+
 ## 为什么不需要额外资源
 
 | 对比 | 向量数据库方案 | Graph Context |
@@ -227,7 +285,7 @@ graph-context/
 │   ├── __init__.py          # 包入口
 │   ├── __main__.py          # python -m graph_context
 │   ├── engine.py            # 核心引擎（AST + BM25 + 图扩散）
-│   ├── server.py            # MCP Server（25+ 工具）
+│   ├── server_consolidated.py  # MCP Server（动态加载，2 个基础工具 + 按需模块）
 │   ├── rules.py             # 规则自进化引擎
 │   ├── project_scope.py     # 多项目作用域管理
 │   ├── synonyms.py          # 中英文同义词映射

@@ -87,58 +87,82 @@ for score, chunk in results:
     print(f"[{score:.2f}] {chunk.file_path}:{chunk.name}")
 ```
 
-## MCP Tools
+## MCP Tools — Dynamic Loading
 
-### Retrieval
+**v6 architecture:** Only 2 tools are injected at startup (~270 tokens). Other tools are loaded on demand via the `tools` manager, saving context tokens in every conversation turn.
 
-| Tool | Description |
-|------|-------------|
-| `retrieve_context` | Basic retrieval: BM25 + AST call graph |
-| `retrieve_context_adaptive` | Adaptive strategy: full-context for small projects, graph diffusion for large |
-| `retrieve_with_dependencies` | Retrieval + cross-file dependencies (function → caller in one hop) |
-| `batch_retrieve` | Batch retrieval, multiple queries at once |
-| `compare_strategies` | Compare token usage across different strategies |
+| Phase | Tools | Token Cost |
+|-------|-------|-----------|
+| Startup | `search` + `tools` | ~270 tokens |
+| + `rules` module | +6 tools | ~770 tokens total |
+| + `admin` module | +11 tools | ~1,670 tokens total |
+| All tools (legacy) | 25+ tools | ~3,000-4,000 tokens |
 
-### MVCC Snapshots (Multi-Agent Collaboration)
+### Always Loaded (Startup)
 
-| Tool | Description |
-|------|-------------|
-| `create_snapshot` | Create MVCC snapshot (COW, no deepcopy) |
-| `read_at_version` | Read index state at a specific version |
-| `get_mvcc_status` | View current version and snapshot list |
+#### `search` — Code Retrieval
 
-**Multi-agent scenario:** Each agent creates an independent snapshot. Read-write operations don't interfere with each other. Agent A writing new index data doesn't affect Agent B's ongoing read. Shared underlying index, zero redundancy.
+Search project code using AST call graph + BM25 ranking.
 
-### Rules Engine (Self-evolving)
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query` | string | required | Natural language or code term to search for |
+| `top_k` | int | 5 | Number of results (max 20) |
+| `mode` | string | `"graph"` | `"graph"` (BM25 + diffusion) or `"deps"` (+ cross-file dependencies) |
 
-| Tool | Description |
-|------|-------------|
-| `add_rule` | Add a rule (auto-enters observation period) |
-| `list_rules` | List rules (filter by type/scope/confidence) |
-| `evaluate_rules` | Evaluate rule effectiveness with ground truth |
-| `apply_rule` | Apply a rule to the retrieval pipeline |
-| `verify_rule` | Verify a rule (correct/incorrect), drives accuracy-based decay |
-| `prune_rules` | Prune low-performing rules |
-| `discover_rules` | Auto-discover candidate rules from ground truth errors |
-| `check_rule_conflicts` | Detect rule conflicts |
-| `check_code_freshness` | Check if rule-associated code has changed |
+#### `tools` — Dynamic Tool Manager
 
-### Project Scopes (Multi-project Management)
+Load/unload tool modules on demand to save context tokens.
 
-| Tool | Description |
-|------|-------------|
-| `create_scope` | Create project scope (strict isolation / shared) |
-| `link_projects` | Link projects (one-way / bidirectional / full sharing) |
-| `search_across_projects` | Cross-project pattern search (returns patterns only, no code) |
-| `list_scopes` | List all project scopes |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `action` | string | `"list"` | `list` / `load` / `unload` / `loaded` |
+| `module` | string | `""` | Module name to load/unload |
 
-### System
+**Usage example (LLM calls):**
+```
+tools(action="list")                          # See available modules
+tools(action="load", module="rules")          # Load rules tools
+tools(action="unload", module="rules")        # Unload when done
+tools(action="loaded")                        # See what's currently loaded
+```
+
+### Module: `rules` — Self-evolving Rules Engine
+
+Load with: `tools(action="load", module="rules")`
 
 | Tool | Description |
 |------|-------------|
-| `health_check` | Engine health check (index stats, file watcher, cache, MVCC) |
-| `get_config` | Get current configuration |
-| `update_config` | Update configuration at runtime |
+| `rules_list` | List retrieval rules (filter by type/scope/confidence/status) |
+| `rules_add` | Add a new rule (auto-enters observation period) |
+| `rules_apply` | Apply a rule (records a hit) |
+| `rules_verify` | Verify a rule as correct/incorrect (drives accuracy-based decay) |
+| `rules_prune` | Prune low-performing rules |
+| `rules_discover` | Auto-discover candidate rules from retrieval errors |
+
+### Module: `admin` — Engine Config, Snapshots, Scopes
+
+Load with: `tools(action="load", module="admin")`
+
+| Tool | Description |
+|------|-------------|
+| `admin_health` | Engine health check (index stats, watcher, cache, MVCC version) |
+| `admin_config` | Get current engine configuration |
+| `admin_update_config` | Update config at runtime |
+| `snapshot_create` | Create MVCC snapshot (COW, no deepcopy) |
+| `snapshot_read` | Read snapshot at a specific version |
+| `snapshot_status` | Get MVCC status |
+| `scope_create` | Create project scope (strict isolation / shared) |
+| `scope_list` | List all project scopes |
+| `scope_link` | Link two projects |
+| `synonym_add` | Add Chinese-English synonym mapping |
+| `synonym_discover` | Discover candidate synonyms from unmatched query tokens |
+
+### Resources
+
+| URI | Description |
+|-----|-------------|
+| `context://stats` | Engine statistics (chunks, edges, cache) |
 
 ## Configuration
 
@@ -156,6 +180,22 @@ Configured via environment variables, all with sensible defaults:
 | `MCP_SCOPES_PATH` | `scopes/scopes.json` | Scopes storage path |
 
 ## Token Savings Explained
+
+### Tool Definition Overhead
+
+Every conversation turn carries tool definitions as context. Dynamic loading drastically reduces this cost:
+
+```
+Legacy (all 25+ tools injected):
+  Every turn: ~3,500 tokens for tool definitions
+  10-turn conversation: ~35,000 tokens wasted on tool definitions alone
+
+Dynamic loading (v6):
+  Startup: ~270 tokens (search + tools)
+  10-turn conversation (search only): ~2,700 tokens
+  10-turn conversation (search + rules): ~7,700 tokens
+  Savings: 78-92% on tool definition overhead
+```
 
 ### Single-Agent Scenario
 
@@ -202,6 +242,24 @@ With Graph Context (3 agents sharing index):
   Savings: 87%+
 ```
 
+## Benchmark Results
+
+Tested with the built-in token simulation (`python -m tests.token_simulation`):
+
+| Project Size | BM25 Recall | BM25 + Rules | Token Savings | Rules Created |
+|-------------|------------|-------------|--------------|--------------|
+| Small (4 modules) | 100% | 100% | 76.3% | 0 |
+| Medium (10 modules) | 85% → 100% | 100% | 88.7% | 4 |
+| Large (14 modules) | 80% → 100% | 97% | 90.7% | 6 |
+
+Cost comparison (Large project, Claude 3.5 Sonnet):
+
+| Scenario | Cost |
+|----------|------|
+| Without MCP | ¥14.83 |
+| With MCP (with rules) | ¥3.30 |
+| **Savings** | **78%** |
+
 ## Why Zero Extra Resources
 
 | Comparison | Vector DB Approach | Graph Context |
@@ -227,7 +285,7 @@ graph-context/
 │   ├── __init__.py          # Package entry
 │   ├── __main__.py          # python -m graph_context
 │   ├── engine.py            # Core engine (AST + BM25 + graph diffusion)
-│   ├── server.py            # MCP Server (25+ tools)
+│   ├── server_consolidated.py  # MCP Server (dynamic loading, 2 base + on-demand modules)
 │   ├── rules.py             # Self-evolving rules engine
 │   ├── project_scope.py     # Multi-project scope management
 │   ├── synonyms.py          # CN/EN synonym mapping
